@@ -1,0 +1,7 @@
+{
+    "name": "DRL",
+    "build": {
+        "libArchive": false
+    },
+    "dependencies": {}
+}

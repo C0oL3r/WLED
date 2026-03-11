@@ -1,0 +1,420 @@
+#include <wled.h>
+
+class DRL : public Usermod {
+private:
+  bool enabled = false;
+  uint8_t pinStanga = -1;
+  uint8_t pinDreapta = -1;
+  // int pinAvarii = -1;
+
+  uint8_t bStanga = -1;
+  uint8_t bDreapta = -1;
+
+  int pinThreshold = 10;
+
+  // bool wipeFreeze = false;
+  // uint8_t wipeState = 0;
+
+  // int presetStanga = -1;
+  // int presetDreapta = -1;
+  // int presetAvarii = -1;
+  bool loaded = false;
+  static const char _name[];
+  static const char _enabled[];
+  // static const char _wipeFreezeEnabled[];
+  static const char _effectFadeDelay[];
+  static const char _pinStanga[];
+  static const char _pinDreapta[];
+  static const char _pinAvarii[];
+  static const char _pinThreshold[];
+
+public:
+  // DRL();
+  // ~DRL() {};
+  void addToConfig(JsonObject &root);
+  bool readFromConfig(JsonObject &root);
+  void readFromJsonState(JsonObject &root);
+  void onStateChange(uint8_t mode);
+  // void allocatePins();
+  // void deallocatePins();
+  void setup() override;
+  void loop() override;
+  bool handleButtonAAA(uint8_t b);
+  bool handleButton(uint8_t b);
+  // uint8_t getEffectOffDelay() const { return effectFadeDelay; }
+  // unsigned long getWipeStartTime(uint8_t segid) { return
+  // wipeStartTime[segid]; }
+  unsigned long wipeStartTime[MAX_NUM_SEGMENTS] = {0};
+  uint16_t effectFadeDelay = 50;
+  uint8_t fadePresets[MAX_NUM_SEGMENTS] = {0};
+  // static uint16_t wipe_once(void);
+};
+const char DRL::_name[] PROGMEM = "DRL Button Handler";
+const char DRL::_enabled[] PROGMEM = "Activeaza";
+// const char DRL::_wipeFreezeEnabled[] PROGMEM = "Activeaza freeze wipe";
+const char DRL::_effectFadeDelay[] PROGMEM = "Effect Fade Delay";
+const char DRL::_pinStanga[] PROGMEM = "Semnal Stanga";
+const char DRL::_pinDreapta[] PROGMEM = "Semnal Dreapta";
+// const char DRL::_pinAvarii[] PROGMEM = "Avarii";
+const char DRL::_pinThreshold[] PROGMEM = "Pin Threshold";
+
+DRL *modInstance = nullptr;
+
+void DRL::addToConfig(JsonObject &root) {
+  JsonObject top = root.createNestedObject(FPSTR(_name));
+  top[FPSTR(_enabled)] = enabled;
+  // top[FPSTR(_wipeFreezeEnabled)] = wipeFreeze;
+
+  JsonObject effectSettings = top.createNestedObject(F("Effect"));
+  effectSettings[FPSTR(_effectFadeDelay)] = effectFadeDelay;
+
+  JsonObject pinsSettings = top.createNestedObject(F("Pins"));
+  pinsSettings[FPSTR(_pinStanga)] = pinStanga;
+  pinsSettings[FPSTR(_pinDreapta)] = pinDreapta;
+  pinsSettings[FPSTR(_pinThreshold)] = pinThreshold;
+  // pinsSettings[F("Avarii")] = pinAvarii;
+  // pinsSettings[F("Flash")] = PinFlash;
+  // JsonObject presetsSettings = top.createNestedObject(F("Presets"));
+  // presetsSettings[F("Preset Threshold")] = pinThreshold;
+  // presetsSettings[F("Semnal Stanga")] = presetStanga;
+  // presetsSettings[F("Semnal Dreapta")] = presetDreapta;
+  // presetsSettings[F("Semnal Avarii")] = presetAvarii;
+  // presetsSettings[F("OFF Semnal Stanga")] = PresetSSOff;
+  // presetsSettings[F("Semnal Dreapta")] = PresetSD;
+  // presetsSettings[F("OFF Semnal Dreapta")] = PresetSDOff;
+  // presetsSettings[F("Avarii")] = PresetA;
+  // presetsSettings[F("OFF Avarii")] = PresetAOff;
+  // presetsSettings[F("Release Delay")] = ReleaseDelay;
+}
+
+bool DRL::readFromConfig(JsonObject &root) {
+  // default settings values could be set here (or below using the 3-argument
+  // getJsonValue()) instead of in the class definition or constructor setting
+  // them inside readFromConfig() is slightly more robust, handling the rare but
+  // plausible use case of single value being missing after boot (e.g. if the
+  // cfg.json was manually edited and a value was removed)
+
+  JsonObject top = root[FPSTR(_name)];
+
+  if (top.isNull()) {
+    DEBUG_PRINT(FPSTR(_name));
+    DEBUG_PRINTLN(F(": No config found. (Using defaults.)"));
+  }
+
+  bool configComplete = !top.isNull();
+  configComplete &= getJsonValue(top[FPSTR(_enabled)], enabled);
+  // configComplete &= getJsonValue(top[FPSTR(_wipeFreezeEnabled)], wipeFreeze);
+  // enabled = top[FPSTR(enabled)] || enabled;
+
+  JsonObject effectSettings = top[F("Effect")];
+  if (effectSettings.isNull()) {
+    DEBUG_PRINT(FPSTR(_name));
+    DEBUG_PRINTLN(F(": No effect settings found. (Using defaults.)"));
+  }
+  configComplete = !effectSettings.isNull();
+  configComplete &= getJsonValue(effectSettings[FPSTR(_effectFadeDelay)],
+                                 effectFadeDelay, 50);
+
+  JsonObject pinsSettings = top[F("Pins")];
+  if (pinsSettings.isNull()) {
+    DEBUG_PRINT(FPSTR(_name));
+    DEBUG_PRINTLN(F(": No pin configuration found. (Using defaults.)"));
+  }
+
+  configComplete = !pinsSettings.isNull();
+  // int tmpFlash = -1;
+  // int8_t oldPinStanga = pinStanga;
+  // int8_t oldPinDreapta = pinDreapta;
+  // int8_t oldPinAvarii = pinAvarii;
+
+  configComplete &=
+      getJsonValue(pinsSettings[FPSTR(_pinStanga)], pinStanga, -1);
+  configComplete &=
+      getJsonValue(pinsSettings[FPSTR(_pinDreapta)], pinDreapta, -1);
+  configComplete &=
+      getJsonValue(pinsSettings[FPSTR(_pinThreshold)], pinThreshold, 10);
+  // configComplete &= getJsonValue(pinsSettings[FPSTR(_pinAvarii)], pinAvarii,
+  // -1); configComplete &= getJsonValue(pinsSettings[F("Flash")], tmpFlash,
+  // -1);
+
+  // JsonObject presetsSettings = top[F("Presets")];
+  // if(presetsSettings.isNull())
+  // {
+  //     DEBUG_PRINT(FPSTR(_name));
+  //     DEBUG_PRINTLN(F(": No presets configuration found. (Using
+  //     defaults.)")); return false;
+  // }
+
+  // configComplete = !presetsSettings.isNull();
+  // configComplete &= getJsonValue(presetsSettings[FPSTR(_pinThreshold)],
+  // pinThreshold, 10); configComplete &=
+  // getJsonValue(presetsSettings[FPSTR(_pinStanga)], presetStanga, 1);
+  // // configComplete &= getJsonValue(presetsSettings[F("OFF Semnal Stanga")],
+  // PresetSSOff, 1); configComplete &=
+  // getJsonValue(presetsSettings[FPSTR(_pinDreapta)], presetDreapta, 1);
+  // // configComplete &= getJsonValue(presetsSettings[F("OFF Semnal Dreapta")],
+  // PresetSDOff, 1); configComplete &=
+  // getJsonValue(presetsSettings[FPSTR(_pinAvarii)], presetAvarii, 1);
+  // // configComplete &= getJsonValue(presetsSettings[F("OFF Avarii")],
+  // PresetAOff, 1);
+  // // configComplete &= getJsonValue(presetsSettings[F("Release Delay")],
+  // ReleaseDelay, 1000);
+
+  // if(loaded)
+  // {
+  //     if (oldPinStanga != pinStanga || oldPinDreapta != pinDreapta ||
+  //     oldPinAvarii != pinAvarii)//|| tmpFlash != PinFlash)
+  //     {
+  //         if (oldPinStanga != -1)
+  //             pinManager.deallocatePin(oldPinStanga, PinOwner::UM_DRL);
+  //         if (oldPinDreapta != -1)
+  //             pinManager.deallocatePin(oldPinDreapta, PinOwner::UM_DRL);
+  //         if (oldPinAvarii != -1)
+  //             pinManager.deallocatePin(oldPinAvarii, PinOwner::UM_DRL);
+
+  //        allocatePins();
+  //     }
+  // }
+  // else setupData();
+  if (configComplete) {
+    bStanga = -1;
+    bDreapta = -1;
+    loaded = true;
+  }
+  return configComplete;
+}
+
+// void DRL::allocatePins()
+// {
+//     if (pinStanga != -1)
+//     {
+//         pinManager.allocatePin(pinStanga, false, PinOwner::UM_DRL);
+//         // pinMode(pinStanga, INPUT_PULLUP);
+//     }
+//     if (pinDreapta != -1)
+//     {
+//         pinManager.allocatePin(pinDreapta, false, PinOwner::UM_DRL);
+//         // pinMode(pinDreapta, INPUT_PULLUP);
+//     }
+//     if (pinAvarii != -1)
+//     {
+//         pinManager.allocatePin(pinAvarii, false, PinOwner::UM_DRL);
+//         // pinMode(pinAvarii, INPUT_PULLUP);
+//     }
+// }
+
+bool buttonActionDone[WLED_MAX_BUTTONS] _INIT({false});
+
+bool DRL::handleButton(uint8_t b) {
+  yield();
+  if (!enabled || !loaded || buttonType[b] != BTN_TYPE_PUSH)
+    return false;
+
+  unsigned int now = millis();
+  bool handled = false;
+
+  if (btnPin[b] == pinStanga || btnPin[b] == pinDreapta) {
+    if (bStanga == -1 && btnPin[b] == pinStanga)
+      bStanga = b;
+    if (bDreapta == -1 && btnPin[b] == pinDreapta)
+      bDreapta = b;
+
+    if (isButtonPressed(b)) {
+      DEBUG_PRINT(F("Button pressed, waiting for threshold. "));
+      DEBUG_PRINTLN(now - buttonPressedTime[b]);
+      if (!buttonPressedBefore[b]) {
+        buttonPressedTime[b] = now;
+        buttonActionDone[b] = false;
+      }
+      buttonPressedBefore[b] = true;
+
+      if (!buttonActionDone[b] && now - buttonPressedTime[b] > pinThreshold) {
+        if ((btnPin[b] == pinStanga && buttonPressedBefore[bDreapta]) ||
+            (btnPin[b] == pinDreapta && buttonPressedBefore[bStanga])) {
+          DEBUG_PRINTLN("Both buttons pressed, AVARII");
+        } else {
+          DEBUG_PRINTLN("Threshold passed.");
+          shortPressAction(b);
+          buttonActionDone[b] = true;
+          buttonPressedTime[b] = now;
+        }
+      }
+    } else if (buttonPressedBefore[b]) {
+      if (now - buttonPressedTime[b] > pinThreshold) {
+        DEBUG_PRINTLN("Threshold failed.");
+        buttonPressedBefore[b] = false;
+      } else if (buttonActionDone[b])
+        buttonPressedBefore[b] = false;
+    }
+    handled = true;
+  }
+
+  return handled;
+}
+
+bool DRL::handleButtonAAA(
+    uint8_t b) // Pentru comparator, intrare separata avarii
+{
+  yield();
+  if (!enabled || !loaded || buttonType[b] != BTN_TYPE_PUSH)
+    return false;
+
+  unsigned int now = millis();
+  bool handled = false;
+
+  if (btnPin[b] == pinStanga || btnPin[b] == pinDreapta) {
+    handled = true;
+    if (isButtonPressed(b)) {
+      DEBUG_PRINT(F("Button pressed, waiting for threshold. "));
+      DEBUG_PRINTLN(now - buttonPressedTime[b]);
+      if (!buttonPressedBefore[b]) {
+        buttonPressedTime[b] = now;
+        buttonActionDone[b] = false;
+      }
+      buttonPressedBefore[b] = true;
+
+      if (!buttonActionDone[b] && now - buttonPressedTime[b] > pinThreshold) {
+        DEBUG_PRINTLN("Threshold passed.");
+        shortPressAction(b);
+        buttonActionDone[b] = true;
+        buttonPressedTime[b] = now;
+      }
+    } else if (buttonPressedBefore[b]) {
+      if (now - buttonPressedTime[b] > pinThreshold) {
+        DEBUG_PRINTLN("Threshold failed.");
+        buttonPressedBefore[b] = false;
+      } else if (buttonActionDone[b])
+        buttonPressedBefore[b] = false;
+    }
+  }
+  return handled;
+}
+
+void DRL::readFromJsonState(JsonObject &root) {
+  memset(modInstance->fadePresets, 0, sizeof(modInstance->fadePresets));
+  if (root["fadePreset"]) {
+    DEBUG_PRINT("PRESET FOUND IN JSON: ");
+    uint8_t preset = root["fadePreset"];
+    DEBUG_PRINTLN(preset);
+
+    JsonArray segArray = root["seg"].as<JsonArray>();
+    if (!segArray.isNull() && segArray.size() > 0) {
+      // Extragem ID-ul primului segment
+      int firstSegId = segArray[0]["id"] | 0;
+      DEBUG_PRINT("SEGID FOUND: ");
+      DEBUG_PRINTLN(firstSegId);
+      if (firstSegId != -1)
+        modInstance->fadePresets[firstSegId] = preset;
+    }
+  }
+}
+
+void DRL::onStateChange(uint8_t mode) {
+  DEBUG_PRINT("Mode: ");
+  DEBUG_PRINTLN(mode);
+}
+
+void DRL::loop() {
+  // if (!wipeFreeze || !loaded || strip.isUpdating()) return;
+
+  // if(effectCurrent == FX_MODE_COLOR_WIPE)
+  // {
+  //     if(wipeState == 1)
+  //     {
+  //         uint32_t cycleTime = 750 + (255 - effectSpeed)*150; //this is how
+  //         long one wipe takes (minus 25 ms to make sure we switch in time) if
+  //         (millis() + strip.timebase > (cycleTime - 25)) { //wipe complete
+  //             effectCurrent = FX_MODE_STATIC;
+  //             colorUpdated(CALL_MODE_NOTIFICATION);
+  //             wipeState = 0;
+  //         }
+  //     }
+  // }
+}
+
+#define PALETTE_SOLID_WRAP (strip.paletteBlend == 1 || strip.paletteBlend == 3)
+uint16_t wipe_once(void) {
+  uint8_t segid = strip.getCurrSegmentId();
+  if (SEGENV.call == 0) {
+    DEBUG_PRINTLN("Call is 0");
+    DEBUG_PRINT("Fade preset: ");
+    DEBUG_PRINTLN(modInstance->fadePresets[segid]);
+    DEBUG_PRINT("SEGID: ");
+    DEBUG_PRINTLN(segid);
+    SEGENV.step = 0;
+    // strip.now = 0;
+    modInstance->wipeStartTime[segid] = millis();
+  }
+
+  if (SEGENV.step == 1) {
+    if (millis() - modInstance->wipeStartTime[segid] >
+        modInstance->effectFadeDelay) {
+      SEGENV.step = 2;
+      // if(modInstance->fadePresets[segid] != 0)
+      // {
+      //     applyPreset(modInstance->fadePresets[segid]);
+      // }
+      modInstance->wipeStartTime[segid] = SEGMENT.next_time;
+    }
+    return FRAMETIME;
+  }
+
+  if (SEGENV.step == 2) {
+    uint32_t fadeDuration = 500; // Durata fade-in (în ms)
+    uint32_t elapsedFade = millis() - modInstance->wipeStartTime[segid];
+
+    if (elapsedFade > fadeDuration) {
+      SEGENV.step = 3; // Trecem la final
+      return FRAMETIME;
+    }
+
+    uint8_t brightness =
+        (elapsedFade * 255) / fadeDuration; // Progres de la 0 la 255
+    uint32_t fadeColor = color_blend(
+        0, SEGCOLOR(1), brightness); // Interpolare între negru și BG color
+
+    SEGMENT.fill(fadeColor);
+    return FRAMETIME;
+  }
+
+  if (SEGENV.step == 3) {
+    return FRAMETIME;
+  }
+
+  uint32_t cycleTime = 750 + (255 - SEGMENT.speed) * 150;
+  uint32_t elapsed = millis() - modInstance->wipeStartTime[segid];
+  unsigned prog = (elapsed * 65535) / cycleTime;
+
+  unsigned ledIndex = (prog * SEGLEN) >> 15;
+
+  uint32_t col0 = SEGMENT.color_from_palette(0, true, PALETTE_SOLID_WRAP, 0);
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    if (i <= ledIndex) {
+      SEGMENT.setPixelColor(i, col0);
+    } else
+      SEGMENT.setPixelColor(i, 0);
+  }
+
+  if (ledIndex >= SEGLEN - 1) {
+    DEBUG_PRINTLN(F("Effect done"));
+    SEGENV.step = 1;
+    modInstance->wipeStartTime[segid] = millis();
+    DEBUG_PRINT("OFF DELAY: ");
+    DEBUG_PRINTLN(modInstance->effectFadeDelay);
+    SEGENV.fill(BLACK);
+    // SEGMENT.setColor(0, 0);
+    // stateUpdated(CALL_MODE_DIRECT_CHANGE);
+    // colorUpdated(CALL_MODE_DIRECT_CHANGE);
+  }
+  return FRAMETIME;
+}
+static const char _data_FX_MODE__WIPE_ONCE[] PROGMEM = "Wipe Once@!,!;!,!;!";
+
+void DRL::setup() {
+  modInstance = this;
+  DEBUG_PRINTLN(F("Setup done"));
+  strip.addEffect(255, &wipe_once, _data_FX_MODE__WIPE_ONCE);
+}
+
+static DRL DRLUsermod;
+REGISTER_USERMOD(DRLUsermod);

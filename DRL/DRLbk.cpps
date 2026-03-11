@@ -1,0 +1,646 @@
+#include <wled.h>
+/*
+ * Usermod pt semnalizari si DRL
+ */
+
+void wipe_once(void);
+
+struct SegmentBackup
+{
+  uint32_t colors[3];
+  uint16_t options;
+  uint8_t mode;
+  uint8_t palette;
+  uint8_t speed;
+  uint8_t intensity;
+  uint8_t custom1;
+  uint8_t custom2;
+  uint8_t custom3;
+  bool check1;
+  bool check2;
+  bool check3;
+  uint8_t cct;
+};
+
+class DRL : public Usermod
+{
+private:
+  bool enabled = false;
+  int8_t pinStanga = -1;
+  int8_t pinDreapta = -1;
+  uint8_t leftSegmentId = 0;
+  uint8_t rightSegmentId = 1;
+
+  // State Tracking for the fast polling loop
+  bool lastLeftState = false;
+  bool lastRightState = false;
+  unsigned long lastDebounceTimeLeft = 0;
+  unsigned long lastDebounceTimeRight = 0;
+  unsigned long lastSignalHighLeft = 0;
+  unsigned long lastSignalHighRight = 0;
+  String currentStatus = "IDLE";
+
+  // Variables for the wipe_once effect
+  uint8_t wipeOnceEffectId = 0;
+  unsigned long wipeStartTime[MAX_NUM_SEGMENTS] = {0};
+  uint16_t effectWipeSpeed = 400;
+  uint16_t effectFadeDelay = 50;
+  uint16_t effectFadeInDuration = 500;
+  uint8_t fadePresets[MAX_NUM_SEGMENTS] = {0};
+
+  SegmentBackup backups[MAX_NUM_SEGMENTS];
+  bool isSignaling[MAX_NUM_SEGMENTS] = {false}; // True if segment is running our custom blink
+  bool isAborting[MAX_NUM_SEGMENTS] = {false};  // True if segment is currently being forcefully aborted to step 2
+  bool isFadingIn[MAX_NUM_SEGMENTS] = {false};  // True if segment is doing the 500ms fade back to preview
+  unsigned long fadeStartTime[MAX_NUM_SEGMENTS] = {0};
+  // Preset Extraction
+  uint16_t signalPresetId = 0;
+  bool pendingPresetLoad = false;
+  unsigned long pendingPresetTimer = 0;
+  uint8_t effectSpeed = 128;
+  uint8_t effectIntensity = 128;
+  uint8_t effectColorPrimary[3] = {255, 100, 0};
+  uint8_t effectColorSecondary[3] = {255, 255, 255};
+
+  static const char _name[];
+  static const char _enabled[];
+  static const char _pinStanga[];
+  static const char _pinDreapta[];
+  static const char _leftSegId[];
+  static const char _rightSegId[];
+  static const char _effectWipeSpeed[];
+  static const char _effectFadeDelay[];
+  static const char _effectFadeInDuration[];
+  static const char _signalPresetId[];
+  static const char _hazardSyncThreshold[];
+
+public:
+  void setup() override
+  {
+    // Înregistrăm efectul nostru custom care va rula codul `wipe_once` de mai jos
+    // Salvăm ID-ul alocat dinamic de WLED pentru a-l folosi mai târziu în setMode
+    wipeOnceEffectId = strip.addEffect(255, &wipe_once, "Wipe Once@!,!;!,!;!");
+
+    // Alocăm fizic pinii ca input ca să îi putem citi în loop()
+    if (pinStanga != -1)
+    {
+      if (PinManager::allocatePin(pinStanga, false, PinOwner::UM_Unspecified))
+      {
+        pinMode(pinStanga, INPUT_PULLDOWN); // Presupunând că LM393 dă HIGH la semnal
+      }
+      else
+      {
+        Serial.println(F("DRL: Failed to allocate pinStanga!"));
+      }
+    }
+    if (pinDreapta != -1)
+    {
+      if (PinManager::allocatePin(pinDreapta, false, PinOwner::UM_Unspecified))
+      {
+        pinMode(pinDreapta, INPUT_PULLDOWN);
+      }
+      else
+      {
+        Serial.println(F("DRL: Failed to allocate pinDreapta!"));
+      }
+    }
+
+    Serial.println(F("DRL Usermod Setup complete."));
+  }
+
+  void loop() override
+  {
+    // Intervenție pentru Fade-In progresiv prin Opacity (Ruleaza in fundal, oricare ar fi efectul WLED activ)
+    for (uint8_t i = 0; i < strip.getSegmentsNum(); i++)
+    {
+      if (isFadingIn[i])
+      {
+        Segment &seg = strip.getSegment(i);
+        if (!seg.isActive())
+        {
+          isFadingIn[i] = false;
+          continue;
+        }
+
+        unsigned long elapsed = millis() - fadeStartTime[i];
+        if (elapsed >= effectFadeInDuration)
+        { // Durata setată de utilizator
+          seg.opacity = 255;
+          isFadingIn[i] = false;
+          strip.trigger();
+          Serial.print(F("DRL: Background Fade-In Complete (Opacity 255) on Segment "));
+          Serial.println(i);
+        }
+        else
+        {
+          seg.opacity = (elapsed * 255) / effectFadeInDuration;
+          // Nu apelam strip.trigger() aici!
+          // WLED loop-ul rulează de 10.000 de ori pe secundă; dacă apelăm forțat
+          // render la fiecare iterație, procesorul va muri (Watchdog Crash / Page Load Failed).
+          // WLED va transpune noua opacitate automat la FPS-ul lui normal (aprox 40 FPS).
+        }
+      }
+    }
+
+    // Când edităm setările din interfață, presetul e încărcat întârziat
+    // ca să apuce sistemul WLED să elimine "JSON_LOCK" global
+    if (pendingPresetLoad && millis() - pendingPresetTimer > 1500)
+    {
+      if (loadSignalPreset())
+      {
+        pendingPresetLoad = false;
+      }
+      else
+      {
+        // Dacă e tot blocat buffer-ul, mai aşteaptă 100ms și încearcă iar
+        pendingPresetTimer = millis() - 1400;
+      }
+    }
+
+    // Dacă modulul este oprit din interfață, nu face nimic
+    if (!enabled || strip.isUpdating())
+      return;
+
+    // Citim instantaneu starea senzorilor (LM393) - viteză sub 0.1ms
+    bool currentLeft = (pinStanga != -1) && (digitalRead(pinStanga) == HIGH);
+    bool currentRight = (pinDreapta != -1) && (digitalRead(pinDreapta) == HIGH);
+
+    if (currentLeft)
+      lastSignalHighLeft = millis();
+    if (currentRight)
+      lastSignalHighRight = millis();
+
+    // Logică individuală de reacție ultra-rapidă. Fiecare semnalizare se ghidează doar după ea însăși.
+    // Odată cu trecerea rapidă a manetei de la Stânga la Dreapta, contactele mecanice auto fac un "Switch Bounce"
+    // care generează scântei (impulsuri parazite) de microsecunde pe canalul vechi. Debounce de 50ms elimină problema.
+    // 1. Verificare pentru Opriri și Anulări (Abort)
+    // Dacă o bandă rulează efectul de semnalizare, dar maneta (semnalul electric) s-a oprit debounced sau comutat invers,
+    // oprim imediat animația tăindu-i faza de wipe. Dacă a comutat, oprim INSTANT și sărim Off-Delay-ul.
+    if (!currentLeft && isSignaling[leftSegmentId])
+    {
+      bool leftDebouncedOff = (millis() - lastSignalHighLeft > 50);
+      if (leftDebouncedOff || currentRight)
+      {
+        abortSignalState(leftSegmentId, currentRight);
+      }
+    }
+
+    if (!currentRight && isSignaling[rightSegmentId])
+    {
+      bool rightDebouncedOff = (millis() - lastSignalHighRight > 50);
+      if (rightDebouncedOff || currentLeft)
+      {
+        abortSignalState(rightSegmentId, currentLeft);
+      }
+    }
+
+    // 2. Declanșarea semnalizărilor (Declanșare pe Rising Edge cu Debounce)
+    if (currentLeft && !lastLeftState)
+    {
+      if (millis() - lastDebounceTimeLeft > 50)
+      {
+        currentStatus = "LEFT SIGNAL / HAZARD";
+        Serial.println(F("DRL LOG: LEFT SIGNAL / HAZARD ACTIVATED"));
+        triggerTurnSignal(leftSegmentId);
+        lastDebounceTimeLeft = millis();
+      }
+    }
+
+    if (currentRight && !lastRightState)
+    {
+      if (millis() - lastDebounceTimeRight > 50)
+      {
+        currentStatus = "RIGHT SIGNAL / HAZARD";
+        Serial.println(F("DRL LOG: RIGHT SIGNAL / HAZARD ACTIVATED"));
+        triggerTurnSignal(rightSegmentId);
+        lastDebounceTimeRight = millis();
+      }
+    }
+
+    if (!currentLeft && !currentRight)
+    {
+      currentStatus = "IDLE";
+    }
+
+    // Salvăm starea electrica curenta pentru următorul ciclu
+    lastLeftState = currentLeft;
+    lastRightState = currentRight;
+  }
+
+  bool loadSignalPreset()
+  {
+    if (signalPresetId == 0)
+      return true; // Consider success if no preset is configured
+
+    if (!requestJSONBufferLock(JSON_LOCK_PRESET_LOAD))
+    {
+      Serial.println(F("DRL: JSON Buffer locked, preset load deferred."));
+      return false; // Tells the loop to try again later
+    }
+
+    if (readObjectFromFileUsingId("/presets.json", signalPresetId, pDoc))
+    {
+      JsonObject preset = pDoc->as<JsonObject>();
+      JsonArray segs = preset["seg"];
+
+      if (!segs.isNull() && segs.size() > 0)
+      {
+        JsonObject seg = segs[0];
+
+        if (!seg["sx"].isNull())
+          effectSpeed = seg["sx"];
+        if (!seg["ix"].isNull())
+          effectIntensity = seg["ix"];
+
+        JsonArray cols = seg["col"];
+        if (!cols.isNull())
+        {
+          JsonArray col0 = cols[0];
+          if (!col0.isNull())
+          {
+            effectColorPrimary[0] = col0[0];
+            effectColorPrimary[1] = col0[1];
+            effectColorPrimary[2] = col0[2];
+          }
+          JsonArray col1 = cols[1];
+          if (!col1.isNull())
+          {
+            effectColorSecondary[0] = col1[0];
+            effectColorSecondary[1] = col1[1];
+            effectColorSecondary[2] = col1[2];
+          }
+        }
+        Serial.println(F("DRL: Preset colors & speed extracted successfully!"));
+      }
+    }
+    else
+    {
+      Serial.println(F("DRL: Preset ID not found in /presets.json"));
+    }
+    releaseJSONBufferLock();
+    return true; // We parsed the file and extracted what we could, unlocking success
+  }
+
+  // Funcție extrem de rapidă care atacă direct memoria internă a WLED-ului
+  void triggerTurnSignal(uint8_t segId)
+  {
+    Segment &seg = strip.getSegment(segId);
+    if (!seg.isActive())
+      return;
+
+    // Salvam starea existenta doar la prima apasare a manetei
+    // (ca sa nu o rescriem cu starea de Wipe in caz de multi-flash pe maneta)
+    if (!isSignaling[segId])
+    {
+      // 1. Salvam starea completa a segmentului (Efect, Culori, Paleta, Optiuni, Viteza)
+      backups[segId].colors[0] = seg.colors[0];
+      backups[segId].colors[1] = seg.colors[1];
+      backups[segId].colors[2] = seg.colors[2];
+      backups[segId].options = seg.options;
+      backups[segId].mode = seg.mode;
+      backups[segId].palette = seg.palette;
+      backups[segId].speed = seg.speed;
+      backups[segId].intensity = seg.intensity;
+      backups[segId].custom1 = seg.custom1;
+      backups[segId].custom2 = seg.custom2;
+      backups[segId].custom3 = seg.custom3;
+      backups[segId].check1 = seg.check1;
+      backups[segId].check2 = seg.check2;
+      backups[segId].check3 = seg.check3;
+      backups[segId].cct = seg.cct;
+
+      // Resetam paleta la Solid (0) pentru semnalizare, altfel wipe_once s-ar putea blendui cu animatia veche
+      seg.setPalette(0);
+      isSignaling[segId] = true;
+    }
+
+    // Setăm efectul preluând ID-ul dinamic salvat la pornire
+    seg.setMode(wipeOnceEffectId);
+
+    // Aplicam culorile extrase din Presetul utilizatorului pt clipire
+    seg.setColor(0, RGBW32(effectColorPrimary[0], effectColorPrimary[1], effectColorPrimary[2], 0));
+    seg.setColor(1, RGBW32(effectColorSecondary[0], effectColorSecondary[1], effectColorSecondary[2], 0));
+    seg.speed = effectSpeed;
+    seg.intensity = effectIntensity;
+
+    // Asigurăm că segmentul este POWERED ON
+    seg.setOption(SEG_OPTION_ON, true);
+
+    // Resetăm starea segmentului pentru a forța efectul să o ia de la capăt INSTANTANEU
+    seg.markForReset();
+
+    // Anunțăm banda (WLED) că un segment a suferit modificări critice și trebuie desenat în următorul cadru
+    strip.trigger();
+
+    Serial.print(F("Trigged Turn Signal on Segment: "));
+    Serial.println(segId);
+  }
+
+  // Permite oprirea și trecerea automată în fade-out a unui wipe aflat în rulare (ex. comutare Stânga->Dreapta)
+  void abortSignalState(uint8_t targetSegId, bool forceInstantOff = false)
+  {
+    if (isSignaling[targetSegId])
+    {
+      // Daca suntem in faza de oprire si NU se doreste stingerea instantanee, evitam loop-ul de reset
+      if (isAborting[targetSegId] && !forceInstantOff)
+        return;
+
+      Segment &seg = strip.getSegment(targetSegId);
+      if (seg.isActive() && seg.mode == wipeOnceEffectId)
+      {
+        Serial.print(F("DRL LOG: ABORTING ABUSIVE WIPE ON SEGMENT: "));
+        Serial.println(targetSegId);
+
+        isAborting[targetSegId] = true;
+
+        if (forceInstantOff)
+        {
+          // Sari direct la Faza 3: Revenire instantanee la DRL și fade-in
+          seg.step = 3;
+        }
+        else
+        {
+          // Sari la Faza 2: Off-Delay (așteptare pe negru)
+          seg.step = 2;
+        }
+
+        // Salvăm timpul curent ca punct 0 pentru delay fade, ca să pornească numărătoarea acum.
+        seg.aux0 = strip.now & 0xFFFF;
+
+        // Forțăm banda să randeze imediat segmentul cu noile noastre valori injectate.
+        strip.trigger();
+      }
+    }
+  }
+
+  // Metode folosite de efectul extern pt a prelua starea initiala salvata
+  SegmentBackup *getBackupStruct(uint8_t segId) { return &backups[segId]; }
+  bool getIsSignaling(uint8_t segId) { return isSignaling[segId]; }
+  void finishSignal(uint8_t segId)
+  {
+    isSignaling[segId] = false;
+    isAborting[segId] = false;
+  }
+  void startRestoreFade(uint8_t segId)
+  {
+    isFadingIn[segId] = true;
+    fadeStartTime[segId] = millis();
+  }
+
+  // --- CONFIGURARE INTERFAȚĂ WEB WLED --- //
+  void addToConfig(JsonObject &root) override
+  {
+    JsonObject top = root.createNestedObject(FPSTR(_name));
+    top[FPSTR(_enabled)] = enabled;
+
+    JsonObject pinsSettings = top.createNestedObject(F("Pins"));
+    pinsSettings[FPSTR(_pinStanga)] = pinStanga;
+    pinsSettings[FPSTR(_pinDreapta)] = pinDreapta;
+
+    JsonObject segSettings = top.createNestedObject(F("Segments"));
+    segSettings[FPSTR(_leftSegId)] = leftSegmentId;
+    segSettings[FPSTR(_rightSegId)] = rightSegmentId;
+
+    JsonObject effectSettings = top.createNestedObject(F("Effect"));
+    effectSettings[FPSTR(_effectWipeSpeed)] = effectWipeSpeed;
+    effectSettings[FPSTR(_effectFadeDelay)] = effectFadeDelay;
+    effectSettings[FPSTR(_effectFadeInDuration)] = effectFadeInDuration;
+    effectSettings[FPSTR(_signalPresetId)] = signalPresetId;
+  }
+
+  bool readFromConfig(JsonObject &root)
+  {
+    int8_t oldPinStanga = pinStanga;
+    int8_t oldPinDreapta = pinDreapta;
+
+    JsonObject top = root[FPSTR(_name)];
+    if (top.isNull())
+      return false;
+
+    bool configComplete = !top.isNull();
+    configComplete &= getJsonValue(top[FPSTR(_enabled)], enabled);
+
+    JsonObject pinsSettings = top[F("Pins")];
+    if (!pinsSettings.isNull())
+    {
+      getJsonValue(pinsSettings[FPSTR(_pinStanga)], pinStanga, -1);
+      getJsonValue(pinsSettings[FPSTR(_pinDreapta)], pinDreapta, -1);
+    }
+
+    JsonObject segSettings = top[F("Segments")];
+    if (!segSettings.isNull())
+    {
+      getJsonValue(segSettings[FPSTR(_leftSegId)], leftSegmentId, 0);
+      getJsonValue(segSettings[FPSTR(_rightSegId)], rightSegmentId, 1);
+    }
+
+    JsonObject effectSettings = top[F("Effect")];
+    if (!effectSettings.isNull())
+    {
+      getJsonValue(effectSettings[FPSTR(_effectWipeSpeed)], effectWipeSpeed, 400);
+      getJsonValue(effectSettings[FPSTR(_effectFadeDelay)], effectFadeDelay, 50);
+      getJsonValue(effectSettings[FPSTR(_effectFadeInDuration)], effectFadeInDuration, 500);
+      bool presetChanged = getJsonValue(effectSettings[FPSTR(_signalPresetId)], signalPresetId, 0);
+      if (presetChanged)
+      {
+        // Nu incarcam direct fiindca pDoc e MEREU incuiat de WLED in timpul salvarii setarilor pe o pagina de web!
+        pendingPresetLoad = true;
+        pendingPresetTimer = millis();
+      }
+    }
+
+    // Allocate / Deallocate if changed
+    if (oldPinStanga != pinStanga || oldPinDreapta != pinDreapta)
+    {
+      if (oldPinStanga != -1)
+        PinManager::deallocatePin(oldPinStanga, PinOwner::UM_Unspecified);
+      if (oldPinDreapta != -1)
+        PinManager::deallocatePin(oldPinDreapta, PinOwner::UM_Unspecified);
+
+      if (pinStanga != -1)
+      {
+        PinManager::allocatePin(pinStanga, false, PinOwner::UM_Unspecified);
+        pinMode(pinStanga, INPUT_PULLDOWN);
+      }
+      if (pinDreapta != -1)
+      {
+        PinManager::allocatePin(pinDreapta, false, PinOwner::UM_Unspecified);
+        pinMode(pinDreapta, INPUT_PULLDOWN);
+      }
+    }
+
+    return configComplete;
+  }
+
+  // Se apelează de WLED ori de câte ori statusul intern se schimbă (ex: utilizatorul salvează un preset nou)
+  // "Problema cu flash-ul care nu se actualiza" era fix de aici: DRL descărca preset-ul doar la Boot.
+  void onStateChange(uint8_t mode) override
+  {
+    if (signalPresetId > 0 && enabled)
+    {
+      pendingPresetLoad = true;
+      pendingPresetTimer = millis();
+    }
+  }
+
+  uint16_t getWipeSpeed() { return effectWipeSpeed; }
+  uint16_t getFadeDelay() { return effectFadeDelay; }
+  unsigned long *getStartTimeArray() { return wipeStartTime; }
+};
+
+// Strings pentru Web API
+const char DRL::_name[] PROGMEM = "DRL Direct Sync";
+const char DRL::_enabled[] PROGMEM = "Activeaza DRL";
+const char DRL::_pinStanga[] PROGMEM = "Pin Semnal Stanga (LM393)";
+const char DRL::_pinDreapta[] PROGMEM = "Pin Semnal Dreapta (LM393)";
+const char DRL::_leftSegId[] PROGMEM = "ID Segment Stanga (LED)";
+const char DRL::_rightSegId[] PROGMEM = "ID Segment Dreapta (LED)";
+const char DRL::_effectWipeSpeed[] PROGMEM = "Wipe Speed (ms)";
+const char DRL::_effectFadeDelay[] PROGMEM = "Effect OFF Fade Delay (ms)";
+const char DRL::_effectFadeInDuration[] PROGMEM = "Return to DRL Fade (ms)";
+const char DRL::_signalPresetId[] PROGMEM = "Wipe Preset ID";
+
+// Înregistrarea usermodului și crearea obiectului principal
+static DRL drlUsermod;
+DRL *drInstance = &drlUsermod;
+
+// ---------------------------------------------------------------- //
+// EFECTUL PROPRIU "Wipe Once" (Acesta e apelat de WLED la fiecare Frame)
+// ---------------------------------------------------------------- //
+#define PALETTE_SOLID_WRAP (strip.paletteBlend == 1 || strip.paletteBlend == 3)
+
+void wipe_once(void)
+{
+  if (!drInstance)
+    return;
+
+  uint32_t cycleTime = drInstance->getWipeSpeed(); // Durata wipeului in ms setata direct
+  uint16_t fadeDelay = drInstance->getFadeDelay();
+
+  // Trebuie sa folosim 16-bit time pentru ca SEGENV.aux0 este uint16_t în WLED!
+  // Dacă folosim strip.now direct, aux0 va taia bitii mari și elapsed va fi urias cand uptime > 65 secunde.
+  uint16_t now16 = strip.now & 0xFFFF;
+
+  // Faza 0: INITIALIZARE (Apare la primul apel sau dupa resetIfRequired)
+  if (SEGENV.step == 0)
+  {
+    Serial.println(F("Wipe_Once: STARTING EFFECT (Step 0)"));
+    SEGENV.aux0 = now16; // Salvam timpul de start trunchiat la 16 bit
+    SEGMENT.fill(BLACK); // Curatam segmentul ca wipe-ul sa nu se deseneze peste culorile vechi
+    SEGENV.step = 1;     // Trecem imediat la faza de rulare (Wipe)
+  }
+
+  // Calcul timp scurs in mod sigur pentru uint16 (rezolvă și rollover-ul de la 65535 la 0)
+  uint32_t elapsed = (uint16_t)(now16 - SEGENV.aux0);
+
+  // FAZA 1: WIPE IN (Aprindere progresiva)
+  if (SEGENV.step == 1)
+  {
+    unsigned prog = (elapsed * 65535) / cycleTime;
+    if (elapsed >= cycleTime)
+      prog = 65535; // Cap la Maxim
+
+    unsigned ledIndex = (prog * SEGLEN) >> 15;
+    uint32_t col0 = SEGCOLOR(0); // Folosim Culoarea Primara (Primary Color) a segmentului
+
+    for (unsigned i = 0; i < SEGLEN; i++)
+    {
+      if (i <= ledIndex)
+        SEGMENT.setPixelColor(i, col0);
+      // Nu mai dam ELSE BLACK, pentru ca am dat fill in pasul precedent, lasam wipe-ul sa adauge pixeli.
+    }
+
+    if (elapsed >= cycleTime)
+    {
+      SEGENV.step = 2; // Trecem la pauza Neagră
+      SEGENV.aux0 = strip.now & 0xFFFF;
+      Serial.println(F("Wipe_Once: WIPE FINISHED. WAITING IN BLACK HOLD..."));
+    }
+    return;
+  }
+
+  // FAZA 2: WAIT (Așteptare pe negru/invizibil)
+  if (SEGENV.step == 2)
+  {
+    SEGMENT.fill(BLACK); // Oprim banda cat timp asteptam
+
+    if (elapsed > fadeDelay)
+    {
+      // Daca efectul NU e rulat de semnalizare hw (adica e selectat din Web UI de catre user pt a configura culorile)
+      // atunci ignoram restaurarile fade-ului inapoi si dam reset la efect sa inceapa de la capat incontinuu
+      if (drInstance != nullptr && !drInstance->getIsSignaling(strip.getCurrSegmentId()))
+      {
+        Serial.println(F("Wipe_Once: LOOPING PREVIEW FOR UI (isSignaling is FALSE)"));
+        SEGENV.step = 0; // O ia de la capat pt previzualizare infinită în aplicație
+        return;
+      }
+      else
+      {
+        Serial.println(F("Wipe_Once: PROCEEDING TO RESTORE (isSignaling is TRUE)"));
+      }
+
+      SEGENV.step = 3; // Trecem la Restore/Fade
+      SEGENV.aux0 = strip.now & 0xFFFF;
+      Serial.println(F("Wipe_Once: FADE STARTED (Black to DRL)"));
+    }
+    return;
+  }
+
+  // FAZA 3: RESTAURARE SI FADE-IN CUSTOM PRIN OPACITY
+  if (SEGENV.step >= 3)
+  {
+    uint8_t segId = strip.getCurrSegmentId();
+
+    // Fallback de siguranță: dacă WLED a sărit faza 2/3 din greșeală, prevenim restaurarea aici
+    if (drInstance != nullptr && !drInstance->getIsSignaling(segId))
+    {
+      Serial.println(F("Wipe_Once: FALLBACK LOOP PREVIEW (isSignaling FALSE)"));
+      SEGENV.step = 0;
+      return;
+    }
+
+    // Restauram setarile exact asa cum erau inainte de comutarea manetei
+    SegmentBackup *bk = drInstance->getBackupStruct(segId);
+    if (bk != nullptr)
+    {
+      SEGMENT.colors[0] = bk->colors[0];
+      SEGMENT.colors[1] = bk->colors[1];
+      SEGMENT.colors[2] = bk->colors[2];
+      SEGMENT.options = bk->options;
+      SEGMENT.palette = bk->palette;
+      SEGMENT.speed = bk->speed;
+      SEGMENT.intensity = bk->intensity;
+      SEGMENT.custom1 = bk->custom1;
+      SEGMENT.custom2 = bk->custom2;
+      SEGMENT.custom3 = bk->custom3;
+      SEGMENT.check1 = bk->check1;
+      SEGMENT.check2 = bk->check2;
+      SEGMENT.check3 = bk->check3;
+      SEGMENT.cct = bk->cct;
+
+      // Punem opacitatea (brightness per segment) manual la 0
+      // Usermod-ul `DRL` o va creste progresiv in `loop()` pe parcursul celor 500ms.
+      SEGMENT.opacity = 0;
+
+      // In final, predam fraiele inapoi efectului original (ex: Solid, Aurora, Rainbow etc)
+      // Efectul se va randa dar va fi complet invizibil din cauza opacity=0.
+      // false = nu incarcam culorile default ale efectului, vrem sa le tinem pe ale noastre (din backup).
+      SEGMENT.setMode(bk->mode, false);
+    }
+
+    // Resetam flag-ul pentru a permite un viitor Wipe sa memoreze din nou setarile
+    drInstance->finishSignal(segId);
+
+    // Semnalizam Usermod-ului sa inceapa procesul de Fade-In in background pentru acest segment
+    drInstance->startRestoreFade(segId);
+
+    // Fortam WLED sa randeze noul efect incepand cu frame-ul urmator
+    strip.trigger();
+
+    Serial.println(F("Wipe_Once: SUCCESSFUL RESTORE TO DYNAMIC EFFECT. Background fade triggered."));
+    return;
+  }
+}
+
+// Înregistrăm usermod-ul în sistemul WLED
+REGISTER_USERMOD(drlUsermod);
